@@ -14,6 +14,7 @@ mod workers;
 /// Shared application state passed to handlers.
 pub struct AppState {
     pub redis_conn: redis::aio::MultiplexedConnection,
+    pub config: config::Config,
 }
 
 #[tokio::main]
@@ -27,7 +28,10 @@ async fn main() {
     let cfg = config::Config::from_env();
     let redis_conn = cfg.create_redis_connection().await;
 
-    let state = Arc::new(AppState { redis_conn });
+    let state = Arc::new(AppState {
+        redis_conn,
+        config: cfg,
+    });
 
     // Spawn the timeout monitor worker
     {

@@ -2,9 +2,7 @@ use redis::AsyncCommands;
 use uuid::Uuid;
 use chrono::Utc;
 
-use crate::{
-    models::{IngestLogRequest, SlotMeta, TimelineEntry},
-};
+use crate::models::{AiProcessedResult, SlotMeta, TimelineEntry};
 
 /// Key for tracking recent slot assignments to detect rapid context shifts.
 const CONTEXT_SHIFT_KEY: &str = "context_shift:recent_logs";
@@ -13,10 +11,27 @@ const CONTEXT_SHIFT_WINDOW_SECS: i64 = 180; // 3 minutes
 /// Threshold count to trigger immediate flush of other slots.
 const CONTEXT_SHIFT_THRESHOLD: usize = 3;
 
-/// Process an incoming log: find or create a slot and store the log.
+/// Fetch all existing topic strings from active slots.
+pub async fn get_existing_topics(
+    conn: &redis::aio::MultiplexedConnection,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut con = conn.clone();
+    let uuids: Vec<String> = con.smembers("active_slots").await.unwrap_or_default();
+    let mut topics = Vec::with_capacity(uuids.len());
+    for uuid in &uuids {
+        let meta_key = format!("slot:{}:meta", uuid);
+        if let Some(topic) = con.hget::<_, _, Option<String>>(&meta_key, "topic").await? {
+            topics.push(topic);
+        }
+    }
+    Ok(topics)
+}
+
+/// Process an AI-processed log: find or create a slot by topic and store the summary.
 pub async fn process_log(
     conn: &redis::aio::MultiplexedConnection,
-    req: IngestLogRequest,
+    source: &str,
+    processed: AiProcessedResult,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let mut con = conn.clone();
     let now_ts = Utc::now().timestamp();
@@ -24,13 +39,13 @@ pub async fn process_log(
     // Load all active slot UUIDs
     let uuids: Vec<String> = con.smembers("active_slots").await.unwrap_or_default();
 
-    // Try to find a matching slot
+    // Try to find a matching slot by topic
     let mut matched_uuid: Option<String> = None;
     for uuid in &uuids {
         let meta_key = format!("slot:{}:meta", uuid);
         let topic_opt: Option<String> = con.hget(&meta_key, "topic").await?;
         if let Some(topic) = topic_opt {
-            if topic == req.topic_hint || topic.contains(&req.topic_hint) {
+            if topic == processed.topic || topic.contains(&processed.topic) {
                 matched_uuid = Some(uuid.clone());
                 break;
             }
@@ -42,17 +57,15 @@ pub async fn process_log(
         let timeline_key = format!("slot:{}:timeline", uuid);
         let entry = TimelineEntry {
             timestamp: Utc::now(),
-            source: req.source.clone(),
-            content: req.content.clone(),
+            source: source.to_string(),
+            content: processed.summary.clone(),
         };
         let entry_json = serde_json::to_string(&entry)?;
         con.rpush::<_, _, ()>(&timeline_key, entry_json).await?;
 
         // Update meta
-        let focused = req.focused_file.unwrap_or_else(|| "None".to_string());
         let meta_key = format!("slot:{}:meta", uuid);
         con.hset::<_, _, _, ()>(&meta_key, "last_updated", now_ts).await?;
-        con.hset::<_, _, _, ()>(&meta_key, "focused_file", focused).await?;
         uuid.clone()
     } else {
         // No matching slot – create a new one
@@ -61,8 +74,8 @@ pub async fn process_log(
 
         let meta_key = format!("slot:{}:meta", new_uuid);
         let meta = SlotMeta {
-            topic: req.topic_hint.clone(),
-            focused_file: req.focused_file.unwrap_or_else(|| "None".to_string()),
+            topic: processed.topic.clone(),
+            focused_file: "None".to_string(),
             last_updated: Utc::now(),
         };
         let last_ts = meta.last_updated.timestamp();
@@ -74,8 +87,8 @@ pub async fn process_log(
         let timeline_key = format!("slot:{}:timeline", new_uuid);
         let entry = TimelineEntry {
             timestamp: Utc::now(),
-            source: req.source,
-            content: req.content,
+            source: source.to_string(),
+            content: processed.summary,
         };
         let entry_json = serde_json::to_string(&entry)?;
         con.rpush::<_, _, ()>(&timeline_key, entry_json).await?;
@@ -83,16 +96,10 @@ pub async fn process_log(
     };
 
     // ── Context-shift detection (Section 4.4) ──────────────────────
-    // Track this assignment in a time-windowed list.
     let shift_entry = format!("{}|{}", slot_id, now_ts);
     con.rpush::<_, _, ()>(CONTEXT_SHIFT_KEY, &shift_entry).await?;
-
-    // Trim list to only keep entries within the 3-minute window.
-    // We remove elements older than now_ts - CONTEXT_SHIFT_WINDOW_SECS.
-    // A simple approach: pop from left while the timestamp is too old.
     trim_context_shift_list(&mut con, now_ts).await?;
 
-    // Count how many times this slot appears in the recent window.
     let recent: Vec<String> = con.lrange(CONTEXT_SHIFT_KEY, 0, -1).await.unwrap_or_default();
     let count_for_slot = recent
         .iter()
@@ -100,8 +107,6 @@ pub async fn process_log(
         .count();
 
     if count_for_slot >= CONTEXT_SHIFT_THRESHOLD {
-        // Rapid ingestion detected for this slot – flush all OTHER active slots
-        // that appear stale (their last activity is outside this window).
         for other_uuid in &uuids {
             if *other_uuid == slot_id {
                 continue;
@@ -110,8 +115,6 @@ pub async fn process_log(
             let last_updated_opt: Option<i64> =
                 con.hget(&meta_key, "last_updated").await.unwrap_or(None);
             if let Some(last) = last_updated_opt {
-                // If the other slot's last update is outside the recent window,
-                // consider it abandoned and flush it.
                 if now_ts - last > CONTEXT_SHIFT_WINDOW_SECS {
                     tracing::info!(
                         slot = %other_uuid,
@@ -137,7 +140,6 @@ async fn trim_context_shift_list(
         let front: Option<String> = con.lindex(CONTEXT_SHIFT_KEY, 0).await?;
         match front {
             Some(entry) => {
-                // Format: "uuid|timestamp"
                 if let Some(ts_str) = entry.split('|').nth(1) {
                     if let Ok(ts) = ts_str.parse::<i64>() {
                         if ts < cutoff {
@@ -155,7 +157,6 @@ async fn trim_context_shift_list(
 }
 
 /// Immediately flush a slot: delete its Redis data and remove from active set.
-/// This is called both by the timeout monitor and the context-shift detector.
 pub async fn flush_slot(
     con: &mut redis::aio::MultiplexedConnection,
     uuid: &str,
@@ -165,10 +166,7 @@ pub async fn flush_slot(
     let meta_key = format!("slot:{}:meta", uuid);
     let timeline_key = format!("slot:{}:timeline", uuid);
 
-    // Delete timeline and meta
     con.del::<_, ()>(&[meta_key, timeline_key]).await?;
-
-    // Remove from active set
     con.srem::<_, _, ()>("active_slots", uuid).await?;
 
     Ok(())

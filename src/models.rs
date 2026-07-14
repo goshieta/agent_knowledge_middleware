@@ -1,14 +1,20 @@
 use serde::{Deserialize, Serialize};
 use chrono::{Utc, DateTime};
 
-
 /// Request payload for ingesting a log entry.
+/// Only `source` and raw `content` are accepted; topic and summary are
+/// derived by the AI processor.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct IngestLogRequest {
-    pub source: String,          // e.g., "ocr", "memos"
-    pub topic_hint: String,
-    pub focused_file: Option<String>,
-    pub content: String,
+    pub source: String, // e.g., "ocr", "memos", "voice"
+    pub content: String, // raw, unprocessed data
+}
+
+/// Result of AI processing: extracted topic and summarized content.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct AiProcessedResult {
+    pub topic: String,
+    pub summary: String,
 }
 
 /// Representation of a timeline entry stored in Redis (as JSON).
