@@ -4,6 +4,8 @@ use redis::{aio::MultiplexedConnection, Client};
 
 /// Application configuration loaded from environment variables.
 pub struct Config {
+    /// Server listen port (default: 3000)
+    pub port: u16,
     /// Redis connection URL (e.g., redis://127.0.0.1:6379)
     pub redis_url: String,
     /// OpenAI-compatible API base URL (e.g., http://localhost:8080/v1)
@@ -24,8 +26,13 @@ impl Config {
         let ai_api_key = env::var("AI_API_KEY").ok();
         let ai_model = env::var("AI_MODEL")
             .unwrap_or_else(|_| "gpt-4o-mini".to_string());
+        let port = env::var("PORT")
+            .unwrap_or_else(|_| "3000".to_string())
+            .parse::<u16>()
+            .expect("PORT must be a valid u16 port number");
 
         Config {
+            port,
             redis_url,
             ai_base_url,
             ai_api_key,

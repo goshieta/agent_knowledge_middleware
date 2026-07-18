@@ -41,6 +41,9 @@ async fn main() {
         });
     }
 
+    // Extract port from config before moving state into the router
+    let port = state.config.port;
+
     // Build API router
     let app = Router::new()
         .nest("/", api::api_router())
@@ -48,7 +51,7 @@ async fn main() {
         .layer(axum::extract::Extension(state));
 
     // Run the server
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!(%addr, "Starting server");
     let listener = TcpListener::bind(addr).await.expect("Failed to bind");
     axum::serve(listener, app).await.expect("Server failed");

@@ -47,6 +47,7 @@ ai-proxy/
 
 | 変数名 | 必須 | デフォルト値 | 説明 |
 |--------|------|-------------|------|
+| `PORT` | 任意 | `3000` | サーバーのリッスンポート番号 |
 | `REDIS_URL` | 任意 | `redis://127.0.0.1:6379` | Redis 接続 URL |
 | `AI_BASE_URL` | 任意 | `http://localhost:8080/v1` | OpenAI Compatible API のベース URL |
 | `AI_API_KEY` | 任意 | (なし) | API キー（Bearer トークンとして送信） |
