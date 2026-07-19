@@ -144,14 +144,7 @@ pub async fn generate_embedding(
     }
 
     let emb_resp: EmbeddingResponse = resp.json().await?;
-    let embedding = emb_resp
-        .data
-        .into_iter()
-        .next()
-        .ok_or("Embedding API returned no data")?
-        .embedding;
-
-    Ok(embedding)
+    Ok(emb_resp.embedding)
 }
 
 /// Upsert a compiled memory into Qdrant.

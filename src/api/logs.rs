@@ -44,7 +44,7 @@ pub async fn handle_logs(
     };
 
     // Step 2: Route to slot manager
-    match slot_manager::process_log(&state.redis_conn, &payload.source, processed).await {
+    match slot_manager::process_log(&state.redis_conn, &payload.source, processed, Arc::clone(&state.config)).await {
         Ok(slot_id) => {
             let body = json!({"status": "success", "slot_id": slot_id});
             (axum::http::StatusCode::OK, Json(body))

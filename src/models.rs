@@ -70,16 +70,11 @@ pub struct QdrantPayload {
     pub slot_id: String,
 }
 
-/// A single embedding vector entry returned from the embedding API.
-#[derive(Debug, Deserialize)]
-pub struct EmbeddingData {
-    pub embedding: Vec<f32>,
-}
-
 /// Response from the embedding API.
+/// The API returns a flat structure: { "embedding": [f32, ...] }
 #[derive(Debug, Deserialize)]
 pub struct EmbeddingResponse {
-    pub data: Vec<EmbeddingData>,
+    pub embedding: Vec<f32>,
 }
 
 /// Request body for the embedding API.

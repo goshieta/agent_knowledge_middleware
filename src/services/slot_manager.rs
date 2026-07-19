@@ -35,6 +35,7 @@ pub async fn process_log(
     conn: &redis::aio::MultiplexedConnection,
     source: &str,
     processed: AiProcessedResult,
+    config: Arc<Config>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let mut con = conn.clone();
     let now_ts = Utc::now().timestamp();
@@ -124,7 +125,7 @@ pub async fn process_log(
                         new_slot = %slot_id,
                         "Context shift detected – flushing inactive slot immediately"
                     );
-                    flush_slot(&mut con, other_uuid).await?;
+                    flush_slot_with_compilation(&mut con, other_uuid, Arc::clone(&config)).await?;
                 }
             }
         }
