@@ -200,7 +200,8 @@ curl -X POST http://localhost:3000/api/logs \
 * **既存スロット走査**: `active_slots` の UUID を列挙し、各 `slot:{uuid}:meta.topic` と AI が抽出した `topic` を比較
 * **マッチング**: 完全一致または部分包含で判断
 * **一致時**: `timeline` へ RPUSH（要約を格納）、`last_updated` 更新
-* **不一致時**: 新規 UUID を生成 → `active_slots` に追加 → `meta` と `timeline` を新規作成
+* **不一致時**: Rust 側で事前生成した UUID v4 を新規スロット ID として使用 → `active_slots` に追加 → `meta` と `timeline` を新規作成
+* **アトミック性**: 上記の一連の操作（走査・判定・作成・追記）は Redis Lua スクリプトでアトミックに実行され、並行リクエスト下での重複スロット作成を防止する
 
 ### 7.3 `timeout_monitor.rs` – 非アクティブスロット回収
 1. 60 秒ごとに `active_slots` 全体を取得
@@ -232,7 +233,36 @@ curl -X POST http://localhost:3000/api/logs \
 
 ---
 
-## 8. 実装時の注意点
+## 8. ロギング
+
+全コンポーネントで `tracing` クレートを用いた構造化ログを出力する。ログレベルは環境変数 `RUST_LOG` で制御可能（デフォルトは `info`）。
+
+### 8.1 リクエスト受信時 (`api/logs.rs`)
+* `source` — データソース（`ocr`, `memos`, `voice` 等）
+* `content_len` — 生コンテンツの文字数
+* `content` — 200 文字までに切り詰めたプレビュー（超過時は `...` 付与）
+
+### 8.2 AI 処理完了時 (`services/slot_manager.rs`)
+* `topic` — AI が抽出したトピックラベル
+* `summary` — 150 文字までの要約プレビュー
+* `summary_len` — 要約全体の文字数
+
+### 8.3 Redis 登録完了時 (`services/slot_manager.rs`)
+* `slot_id` — 割り当てられたスロット UUID
+* `topic` — トピック
+* `summary` — 120 文字までの要約プレビュー
+* 新規スロット作成時: `"Created new slot and stored timeline entry"`
+* 既存スロット追記時: `"Appended to existing slot timeline"`
+
+### 8.4 コンテキストシフト検出時
+* フラッシュ対象スロットの UUID と新規スロットの UUID を出力
+
+### 8.5 エラー時
+* 全エラーは `tracing::error!` で記録され、サーバープロセスは継続稼働する
+
+---
+
+## 9. 実装時の注意点
 
 * **エラーハンドリング**: Redis 接続失敗、AI API エラー、JSON パースエラー、Qdrant/Neo4j/Embedding API エラーは `panic!` せず、`tracing` に記録してサーバー稼働を維持すること。
 * **共有状態**: `axum::Extension` を用いて Redis 接続プールと設定情報（`Arc<Config>`）をハンドラ間で安全に共有する。
@@ -240,7 +270,7 @@ curl -X POST http://localhost:3000/api/logs \
 
 ---
 
-## 9. 今後の拡張案
+## 10. 今後の拡張案
 
 * WebSocket を用いたリアルタイム通知機構の追加
 * 認証・認可レイヤー（API キーや OAuth2）によるセキュリティ強化

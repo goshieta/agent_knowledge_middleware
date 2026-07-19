@@ -178,6 +178,17 @@ pub async fn process_log(
     let entry_json = serde_json::to_string(&entry)?;
     let new_slot_id = Uuid::new_v4().to_string();
 
+    // Log AI-processed result before storing
+    {
+        let summary_preview = truncate_str(&processed.summary, 150);
+        tracing::info!(
+            topic = %processed.topic,
+            summary = %summary_preview,
+            summary_len = processed.summary.len(),
+            "AI processing complete – routing to slot"
+        );
+    }
+
     let script = Script::new(ATOMIC_PROCESS_LOG_SCRIPT);
     let result: Vec<String> = script
         .key("active_slots")
@@ -237,7 +248,38 @@ pub async fn process_log(
         }
     }
 
+    // Log successful storage
+    {
+        let summary_preview = truncate_str(&processed.summary, 120);
+        let is_new = result.get(1).map(|s| s == "1").unwrap_or(false);
+        if is_new {
+            tracing::info!(
+                slot_id = %slot_id,
+                topic = %processed.topic,
+                summary = %summary_preview,
+                "Created new slot and stored timeline entry"
+            );
+        } else {
+            tracing::info!(
+                slot_id = %slot_id,
+                topic = %processed.topic,
+                summary = %summary_preview,
+                "Appended to existing slot timeline"
+            );
+        }
+    }
+
     Ok(slot_id)
+}
+
+/// Truncate a string to at most `max_len` characters, appending "..." if truncated.
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.chars().count() <= max_len {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_len).collect();
+        format!("{}...", truncated)
+    }
 }
 
 /// Immediately flush a slot: delete its Redis data and remove from active set.
