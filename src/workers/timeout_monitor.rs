@@ -2,7 +2,7 @@ use redis::AsyncCommands;
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
 
-use crate::services::slot_manager::flush_slot;
+use crate::services::slot_manager::flush_slot_with_compilation;
 use crate::AppState;
 
 /// Background task that checks for inactive slots every 60 seconds.
@@ -10,16 +10,16 @@ pub async fn run_timeout_monitor(state: Arc<AppState>) {
     let mut ticker = interval(Duration::from_secs(60));
     loop {
         ticker.tick().await;
-        if let Err(e) = clean_inactive_slots(&state.redis_conn).await {
+        if let Err(e) = clean_inactive_slots(&state).await {
             tracing::error!(error = %e, "Failed to clean inactive slots");
         }
     }
 }
 
 async fn clean_inactive_slots(
-    conn: &redis::aio::MultiplexedConnection,
+    state: &Arc<AppState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut con = conn.clone();
+    let mut con = state.redis_conn.clone();
 
     // Get all active slot UUIDs
     let uuids: Vec<String> = con.smembers("active_slots").await.unwrap_or_default();
@@ -31,7 +31,12 @@ async fn clean_inactive_slots(
         if let Some(last) = last_updated_opt {
             // 15 minutes = 900 seconds
             if now_ts - last > 900 {
-                flush_slot(&mut con, &uuid).await?;
+                flush_slot_with_compilation(
+                    &mut con,
+                    &uuid,
+                    Arc::clone(&state.config),
+                )
+                .await?;
             }
         }
     }

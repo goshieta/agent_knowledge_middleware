@@ -14,7 +14,7 @@ mod workers;
 /// Shared application state passed to handlers.
 pub struct AppState {
     pub redis_conn: redis::aio::MultiplexedConnection,
-    pub config: config::Config,
+    pub config: Arc<config::Config>,
 }
 
 #[tokio::main]
@@ -25,12 +25,12 @@ async fn main() {
         .init();
 
     // Load configuration and connect to Redis
-    let cfg = config::Config::from_env();
+    let cfg = Arc::new(config::Config::from_env());
     let redis_conn = cfg.create_redis_connection().await;
 
     let state = Arc::new(AppState {
         redis_conn,
-        config: cfg,
+        config: Arc::clone(&cfg),
     });
 
     // Spawn the timeout monitor worker
@@ -38,6 +38,14 @@ async fn main() {
         let state_clone = Arc::clone(&state);
         tokio::spawn(async move {
             workers::timeout_monitor::run_timeout_monitor(state_clone).await;
+        });
+    }
+
+    // Spawn the memory janitor worker (runs weekly)
+    {
+        let cfg_clone = Arc::clone(&cfg);
+        tokio::spawn(async move {
+            workers::janitor_worker::run_janitor_worker(cfg_clone).await;
         });
     }
 

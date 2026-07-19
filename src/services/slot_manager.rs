@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
 use redis::AsyncCommands;
 use uuid::Uuid;
 use chrono::Utc;
 
+use crate::config::Config;
 use crate::models::{AiProcessedResult, SlotMeta, TimelineEntry};
 
 /// Key for tracking recent slot assignments to detect rapid context shifts.
@@ -157,6 +160,7 @@ async fn trim_context_shift_list(
 }
 
 /// Immediately flush a slot: delete its Redis data and remove from active set.
+/// Also triggers long-term memory compilation if a config is provided.
 pub async fn flush_slot(
     con: &mut redis::aio::MultiplexedConnection,
     uuid: &str,
@@ -166,8 +170,54 @@ pub async fn flush_slot(
     let meta_key = format!("slot:{}:meta", uuid);
     let timeline_key = format!("slot:{}:timeline", uuid);
 
-    con.del::<_, ()>(&[meta_key, timeline_key]).await?;
+    con.del::<_, ()>(&[&meta_key, &timeline_key]).await?;
     con.srem::<_, _, ()>("active_slots", uuid).await?;
+
+    Ok(())
+}
+
+/// Flush a slot and compile its timeline into long-term memory.
+/// This variant is used when we have access to the full AppState.
+pub async fn flush_slot_with_compilation(
+    con: &mut redis::aio::MultiplexedConnection,
+    uuid: &str,
+    config: Arc<Config>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Fetch the timeline and topic before deleting
+    let timeline_key = format!("slot:{}:timeline", uuid);
+    let meta_key = format!("slot:{}:meta", uuid);
+
+    let topic: Option<String> = con.hget(&meta_key, "topic").await?;
+    let raw_entries: Vec<String> = con.lrange(&timeline_key, 0, -1).await.unwrap_or_default();
+
+    let timeline_entries: Vec<TimelineEntry> = raw_entries
+        .iter()
+        .filter_map(|s| serde_json::from_str::<TimelineEntry>(s).ok())
+        .collect();
+
+    // Flush the slot from Redis
+    flush_slot(con, uuid).await?;
+
+    // Trigger long-term memory compilation in the background
+    if let Some(topic) = topic {
+        let slot_id = uuid.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = crate::services::memory_compiler::compile_and_store(
+                config,
+                &slot_id,
+                &topic,
+                &timeline_entries,
+            )
+            .await
+            {
+                tracing::error!(
+                    slot_id = %slot_id,
+                    error = %e,
+                    "Failed to compile slot into long-term memory"
+                );
+            }
+        });
+    }
 
     Ok(())
 }

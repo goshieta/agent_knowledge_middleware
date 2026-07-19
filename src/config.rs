@@ -14,6 +14,20 @@ pub struct Config {
     pub ai_api_key: Option<String>,
     /// Model name to use (e.g., "gpt-4o-mini", "llama3")
     pub ai_model: String,
+    /// Qdrant REST API URL (e.g., http://localhost:6333)
+    pub qdrant_url: String,
+    /// Neo4j bolt URI (e.g., bolt://localhost:7687)
+    pub neo4j_uri: String,
+    /// Neo4j username
+    pub neo4j_user: String,
+    /// Neo4j password
+    pub neo4j_password: String,
+    /// Embedding API base URL (e.g., https://aisvr221.aikb.kyutech.ac.jp/api)
+    pub embedding_api_url: String,
+    /// Embedding API authorization password
+    pub embedding_api_password: String,
+    /// Embedding model name
+    pub embedding_model: String,
 }
 
 impl Config {
@@ -31,12 +45,34 @@ impl Config {
             .parse::<u16>()
             .expect("PORT must be a valid u16 port number");
 
+        let qdrant_url = env::var("QDRANT_URL")
+            .unwrap_or_else(|_| "http://localhost:6333".to_string());
+        let neo4j_uri = env::var("NEO4J_URI")
+            .unwrap_or_else(|_| "bolt://localhost:7687".to_string());
+        let neo4j_user = env::var("NEO4J_USER")
+            .unwrap_or_else(|_| "neo4j".to_string());
+        let neo4j_password = env::var("NEO4J_PASSWORD")
+            .unwrap_or_else(|_| "password".to_string());
+        let embedding_api_url = env::var("EMBEDDING_API_URL")
+            .unwrap_or_else(|_| "https://aisvr221.aikb.kyutech.ac.jp/api".to_string());
+        let embedding_api_password = env::var("EMBEDDING_API_PASSWORD")
+            .unwrap_or_else(|_| "password".to_string());
+        let embedding_model = env::var("EMBEDDING_MODEL")
+            .unwrap_or_else(|_| "jeffh/intfloat-multilingual-e5-large:f32".to_string());
+
         Config {
             port,
             redis_url,
             ai_base_url,
             ai_api_key,
             ai_model,
+            qdrant_url,
+            neo4j_uri,
+            neo4j_user,
+            neo4j_password,
+            embedding_api_url,
+            embedding_api_password,
+            embedding_model,
         }
     }
 
