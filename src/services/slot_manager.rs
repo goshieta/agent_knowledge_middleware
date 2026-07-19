@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use redis::{AsyncCommands, Script};
 use chrono::Utc;
+use uuid::Uuid;
 
 use crate::config::Config;
 use crate::models::{AiProcessedResult, TimelineEntry};
@@ -22,8 +23,11 @@ const CONTEXT_SHIFT_THRESHOLD: usize = 3;
 /// ARGV[3] = summary (JSON-escaped timeline entry content)
 /// ARGV[4] = entry_json (full TimelineEntry as JSON string)
 /// ARGV[5] = now_ts (current Unix timestamp)
+/// ARGV[6] = context_shift_window (seconds)
+/// ARGV[7] = context_shift_threshold (count)
+/// ARGV[8] = new_slot_id (pre-generated UUID for potential new slot)
 ///
-/// Returns: { slot_id, is_new, matched_topics_json }
+/// Returns: { slot_id, is_new, flush_candidates..., matched_topics_json }
 const ATOMIC_PROCESS_LOG_SCRIPT: &str = r#"
 local active_slots_key = KEYS[1]
 local context_shift_key = KEYS[2]
@@ -58,13 +62,8 @@ local is_new = 0
 if matched_uuid then
     slot_id = matched_uuid
 else
-    -- Create new slot atomically
-    slot_id = redis.call('UUID')
-    if not slot_id then
-        -- Fallback: use Redis internal time + random for unique ID
-        local seed = redis.call('TIME')
-        slot_id = string.format('%s-%s', seed[1], seed[2])
-    end
+    -- Create new slot atomically using pre-generated UUID from Rust
+    slot_id = ARGV[8]
     redis.call('SADD', active_slots_key, slot_id)
 
     local meta_key = 'slot:' .. slot_id .. ':meta'
@@ -177,6 +176,7 @@ pub async fn process_log(
         content: processed.summary.clone(),
     };
     let entry_json = serde_json::to_string(&entry)?;
+    let new_slot_id = Uuid::new_v4().to_string();
 
     let script = Script::new(ATOMIC_PROCESS_LOG_SCRIPT);
     let result: Vec<String> = script
@@ -189,6 +189,7 @@ pub async fn process_log(
         .arg(now_ts)
         .arg(CONTEXT_SHIFT_WINDOW_SECS)
         .arg(CONTEXT_SHIFT_THRESHOLD)
+        .arg(&new_slot_id)
         .invoke_async(&mut con)
         .await?;
 
