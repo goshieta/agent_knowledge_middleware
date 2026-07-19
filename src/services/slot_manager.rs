@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
-use redis::AsyncCommands;
-use uuid::Uuid;
+use redis::{AsyncCommands, Script};
 use chrono::Utc;
 
 use crate::config::Config;
-use crate::models::{AiProcessedResult, SlotMeta, TimelineEntry};
+use crate::models::{AiProcessedResult, TimelineEntry};
 
 /// Key for tracking recent slot assignments to detect rapid context shifts.
 const CONTEXT_SHIFT_KEY: &str = "context_shift:recent_logs";
@@ -13,6 +12,135 @@ const CONTEXT_SHIFT_KEY: &str = "context_shift:recent_logs";
 const CONTEXT_SHIFT_WINDOW_SECS: i64 = 180; // 3 minutes
 /// Threshold count to trigger immediate flush of other slots.
 const CONTEXT_SHIFT_THRESHOLD: usize = 3;
+
+/// Lua script that atomically finds-or-creates a slot and appends a timeline entry.
+///
+/// KEYS[1] = "active_slots" set
+/// KEYS[2] = CONTEXT_SHIFT_KEY list
+/// ARGV[1] = topic to match / create
+/// ARGV[2] = source string
+/// ARGV[3] = summary (JSON-escaped timeline entry content)
+/// ARGV[4] = entry_json (full TimelineEntry as JSON string)
+/// ARGV[5] = now_ts (current Unix timestamp)
+///
+/// Returns: { slot_id, is_new, matched_topics_json }
+const ATOMIC_PROCESS_LOG_SCRIPT: &str = r#"
+local active_slots_key = KEYS[1]
+local context_shift_key = KEYS[2]
+local topic = ARGV[1]
+local source = ARGV[2]
+local summary = ARGV[3]
+local entry_json = ARGV[4]
+local now_ts = tonumber(ARGV[5])
+local context_shift_window = tonumber(ARGV[6])
+local context_shift_threshold = tonumber(ARGV[7])
+
+-- Gather all active slot UUIDs and their topics in one pass
+local uuids = redis.call('SMEMBERS', active_slots_key)
+local matched_uuid = nil
+local all_topics = {}
+
+for _, uuid in ipairs(uuids) do
+    local meta_key = 'slot:' .. uuid .. ':meta'
+    local existing_topic = redis.call('HGET', meta_key, 'topic')
+    if existing_topic then
+        table.insert(all_topics, existing_topic)
+        -- Match: exact match or existing topic contains the new topic
+        if existing_topic == topic or string.find(existing_topic, topic, 1, true) then
+            matched_uuid = uuid
+        end
+    end
+end
+
+local slot_id
+local is_new = 0
+
+if matched_uuid then
+    slot_id = matched_uuid
+else
+    -- Create new slot atomically
+    slot_id = redis.call('UUID')
+    if not slot_id then
+        -- Fallback: use Redis internal time + random for unique ID
+        local seed = redis.call('TIME')
+        slot_id = string.format('%s-%s', seed[1], seed[2])
+    end
+    redis.call('SADD', active_slots_key, slot_id)
+
+    local meta_key = 'slot:' .. slot_id .. ':meta'
+    redis.call('HSET', meta_key, 'topic', topic, 'focused_file', 'None', 'last_updated', now_ts)
+    is_new = 1
+end
+
+-- Append timeline entry
+local timeline_key = 'slot:' .. slot_id .. ':timeline'
+redis.call('RPUSH', timeline_key, entry_json)
+
+-- Update last_updated on the matched slot
+local meta_key = 'slot:' .. slot_id .. ':meta'
+redis.call('HSET', meta_key, 'last_updated', now_ts)
+
+-- Context-shift detection: push entry and trim old ones
+local shift_entry = slot_id .. '|' .. now_ts
+redis.call('RPUSH', context_shift_key, shift_entry)
+
+-- Trim old entries from context_shift list
+local cutoff = now_ts - context_shift_window
+while true do
+    local front = redis.call('LINDEX', context_shift_key, 0)
+    if not front then break end
+    local parts = {}
+    for part in string.gmatch(front, '[^|]+') do
+        table.insert(parts, part)
+    end
+    if #parts >= 2 then
+        local ts = tonumber(parts[2])
+        if ts and ts < cutoff then
+            redis.call('LPOP', context_shift_key)
+        else
+            break
+        end
+    else
+        break
+    end
+end
+
+-- Count recent entries for this slot
+local recent = redis.call('LRANGE', context_shift_key, 0, -1)
+local count_for_slot = 0
+for _, entry in ipairs(recent) do
+    if string.sub(entry, 1, #slot_id + 1) == slot_id .. '|' then
+        count_for_slot = count_for_slot + 1
+    end
+end
+
+-- Determine which slots to flush (context shift)
+local flush_candidates = {}
+if count_for_slot >= context_shift_threshold then
+    for _, other_uuid in ipairs(uuids) do
+        if other_uuid ~= slot_id then
+            local other_meta_key = 'slot:' .. other_uuid .. ':meta'
+            local last_updated = redis.call('HGET', other_meta_key, 'last_updated')
+            if last_updated then
+                local last = tonumber(last_updated)
+                if last and (now_ts - last) > context_shift_window then
+                    table.insert(flush_candidates, other_uuid)
+                end
+            end
+        end
+    end
+end
+
+-- Return results as a flat array: slot_id, is_new, then flush_candidates...
+local result = {slot_id, tostring(is_new)}
+for _, fc in ipairs(flush_candidates) do
+    table.insert(result, fc)
+end
+-- Append all existing topics
+table.insert(result, cjson.encode(all_topics))
+
+return result
+"#;
 
 /// Fetch all existing topic strings from active slots.
 pub async fn get_existing_topics(
@@ -30,7 +158,10 @@ pub async fn get_existing_topics(
     Ok(topics)
 }
 
-/// Process an AI-processed log: find or create a slot by topic and store the summary.
+/// Process an AI-processed log: atomically find or create a slot by topic and store the summary.
+///
+/// Uses a Redis Lua script to ensure atomicity of the read-check-then-act sequence,
+/// preventing duplicate slot creation under concurrent requests.
 pub async fn process_log(
     conn: &redis::aio::MultiplexedConnection,
     source: &str,
@@ -40,124 +171,72 @@ pub async fn process_log(
     let mut con = conn.clone();
     let now_ts = Utc::now().timestamp();
 
-    // Load all active slot UUIDs
-    let uuids: Vec<String> = con.smembers("active_slots").await.unwrap_or_default();
+    let entry = TimelineEntry {
+        timestamp: Utc::now(),
+        source: source.to_string(),
+        content: processed.summary.clone(),
+    };
+    let entry_json = serde_json::to_string(&entry)?;
 
-    // Try to find a matching slot by topic
-    let mut matched_uuid: Option<String> = None;
-    for uuid in &uuids {
-        let meta_key = format!("slot:{}:meta", uuid);
-        let topic_opt: Option<String> = con.hget(&meta_key, "topic").await?;
-        if let Some(topic) = topic_opt {
-            if topic == processed.topic || topic.contains(&processed.topic) {
-                matched_uuid = Some(uuid.clone());
-                break;
-            }
-        }
+    let script = Script::new(ATOMIC_PROCESS_LOG_SCRIPT);
+    let result: Vec<String> = script
+        .key("active_slots")
+        .key(CONTEXT_SHIFT_KEY)
+        .arg(&processed.topic)
+        .arg(source)
+        .arg(&processed.summary)
+        .arg(&entry_json)
+        .arg(now_ts)
+        .arg(CONTEXT_SHIFT_WINDOW_SECS)
+        .arg(CONTEXT_SHIFT_THRESHOLD)
+        .invoke_async(&mut con)
+        .await?;
+
+    if result.is_empty() {
+        return Err("Atomic process_log script returned no results".into());
     }
 
-    let slot_id = if let Some(ref uuid) = matched_uuid {
-        // Matching slot found – update it
-        let timeline_key = format!("slot:{}:timeline", uuid);
-        let entry = TimelineEntry {
-            timestamp: Utc::now(),
-            source: source.to_string(),
-            content: processed.summary.clone(),
-        };
-        let entry_json = serde_json::to_string(&entry)?;
-        con.rpush::<_, _, ()>(&timeline_key, entry_json).await?;
+    let slot_id = result[0].clone();
+    // result[1] is is_new ("0" or "1")
+    // result[2..n-1] are flush_candidate UUIDs (if any)
+    // result[last] is JSON-encoded all_topics array (we don't need it here)
 
-        // Update meta
-        let meta_key = format!("slot:{}:meta", uuid);
-        con.hset::<_, _, _, ()>(&meta_key, "last_updated", now_ts).await?;
-        uuid.clone()
+    let flush_candidates: Vec<String> = if result.len() > 2 {
+        // Last element is the JSON-encoded topics list; exclude it
+        let candidate_count = result.len() - 3; // slot_id, is_new, topics_json
+        result[2..2 + candidate_count].to_vec()
     } else {
-        // No matching slot – create a new one
-        let new_uuid = Uuid::new_v4().to_string();
-        con.sadd::<_, _, ()>("active_slots", &new_uuid).await?;
-
-        let meta_key = format!("slot:{}:meta", new_uuid);
-        let meta = SlotMeta {
-            topic: processed.topic.clone(),
-            focused_file: "None".to_string(),
-            last_updated: Utc::now(),
-        };
-        let last_ts = meta.last_updated.timestamp();
-        con.hset::<_, _, _, ()>(&meta_key, "topic", &meta.topic).await?;
-        con.hset::<_, _, _, ()>(&meta_key, "focused_file", &meta.focused_file).await?;
-        con.hset::<_, _, _, ()>(&meta_key, "last_updated", last_ts).await?;
-
-        // Create timeline with first entry
-        let timeline_key = format!("slot:{}:timeline", new_uuid);
-        let entry = TimelineEntry {
-            timestamp: Utc::now(),
-            source: source.to_string(),
-            content: processed.summary,
-        };
-        let entry_json = serde_json::to_string(&entry)?;
-        con.rpush::<_, _, ()>(&timeline_key, entry_json).await?;
-        new_uuid
+        vec![]
     };
 
-    // ── Context-shift detection (Section 4.4) ──────────────────────
-    let shift_entry = format!("{}|{}", slot_id, now_ts);
-    con.rpush::<_, _, ()>(CONTEXT_SHIFT_KEY, &shift_entry).await?;
-    trim_context_shift_list(&mut con, now_ts).await?;
-
-    let recent: Vec<String> = con.lrange(CONTEXT_SHIFT_KEY, 0, -1).await.unwrap_or_default();
-    let count_for_slot = recent
-        .iter()
-        .filter(|entry| entry.starts_with(&format!("{}|", slot_id)))
-        .count();
-
-    if count_for_slot >= CONTEXT_SHIFT_THRESHOLD {
-        for other_uuid in &uuids {
-            if *other_uuid == slot_id {
-                continue;
-            }
-            let meta_key = format!("slot:{}:meta", other_uuid);
-            let last_updated_opt: Option<i64> =
-                con.hget(&meta_key, "last_updated").await.unwrap_or(None);
-            if let Some(last) = last_updated_opt {
-                if now_ts - last > CONTEXT_SHIFT_WINDOW_SECS {
-                    tracing::info!(
-                        slot = %other_uuid,
-                        new_slot = %slot_id,
-                        "Context shift detected – flushing inactive slot immediately"
+    // Process context-shift flushes outside the Lua script
+    // (Lua scripts cannot make HTTP calls for memory compilation)
+    if !flush_candidates.is_empty() {
+        for other_uuid in &flush_candidates {
+            tracing::info!(
+                slot = %other_uuid,
+                new_slot = %slot_id,
+                "Context shift detected – flushing inactive slot immediately"
+            );
+            // Clone con for each spawn to avoid lifetime issues
+            let mut flush_con = conn.clone();
+            let flush_config = Arc::clone(&config);
+            let uuid = other_uuid.clone();
+            tokio::spawn(async move {
+                if let Err(e) = flush_slot_with_compilation(&mut flush_con, &uuid, flush_config)
+                    .await
+                {
+                    tracing::error!(
+                        slot = %uuid,
+                        error = %e,
+                        "Failed to flush slot during context shift"
                     );
-                    flush_slot_with_compilation(&mut con, other_uuid, Arc::clone(&config)).await?;
                 }
-            }
+            });
         }
     }
 
     Ok(slot_id)
-}
-
-/// Remove entries from the context-shift list that are older than the window.
-async fn trim_context_shift_list(
-    con: &mut redis::aio::MultiplexedConnection,
-    now_ts: i64,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let cutoff = now_ts - CONTEXT_SHIFT_WINDOW_SECS;
-    loop {
-        let front: Option<String> = con.lindex(CONTEXT_SHIFT_KEY, 0).await?;
-        match front {
-            Some(entry) => {
-                if let Some(ts_str) = entry.split('|').nth(1) {
-                    if let Ok(ts) = ts_str.parse::<i64>() {
-                        if ts < cutoff {
-                            con.lpop::<_, Option<String>>(CONTEXT_SHIFT_KEY, None).await?;
-                            continue;
-                        }
-                    }
-                }
-                break;
-            }
-            None => break,
-        }
-    }
-    Ok(())
 }
 
 /// Immediately flush a slot: delete its Redis data and remove from active set.
