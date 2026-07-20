@@ -28,37 +28,58 @@ const COMPACTION_SYSTEM_PROMPT: &str = r#"# 役割
 pub async fn run_janitor_cycle(
     config: Arc<Config>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tracing::info!("Starting memory janitor cycle");
+    tracing::info!("=== Starting memory janitor cycle ===");
 
     // 3.1 Merge similar nodes
-    if let Err(e) = merge_similar_nodes(&config).await {
-        tracing::error!(error = %e, "Failed to merge similar nodes");
+    tracing::info!("Janitor step 1/3: Merging similar nodes");
+    match merge_similar_nodes(&config).await {
+        Ok(merge_count) => {
+            tracing::info!(merge_count = merge_count, "Node merging complete");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to merge similar nodes");
+        }
     }
 
     // 3.2 Compact old memories
-    if let Err(e) = compact_old_memories(&config).await {
-        tracing::error!(error = %e, "Failed to compact old memories");
+    tracing::info!("Janitor step 2/3: Compacting old memories");
+    match compact_old_memories(&config).await {
+        Ok(compact_count) => {
+            tracing::info!(compact_count = compact_count, "Memory compaction complete");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to compact old memories");
+        }
     }
 
     // 3.3 Clean orphan data
-    if let Err(e) = clean_orphans(&config).await {
-        tracing::error!(error = %e, "Failed to clean orphans");
+    tracing::info!("Janitor step 3/3: Cleaning orphan data");
+    match clean_orphans(&config).await {
+        Ok(orphan_count) => {
+            tracing::info!(orphan_count = orphan_count, "Orphan cleanup complete");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to clean orphans");
+        }
     }
 
-    tracing::info!("Memory janitor cycle complete");
+    tracing::info!("=== Memory janitor cycle complete ===");
     Ok(())
 }
 
 /// 3.1 Merge similar nodes: find nodes with similar names and merge them.
+/// Returns the total number of merged pairs.
 async fn merge_similar_nodes(
     config: &Config,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let graph = neo4rs::Graph::new(
         &config.neo4j_uri,
         &config.neo4j_user,
         &config.neo4j_password,
     )
     .await?;
+
+    let mut total_merged = 0usize;
 
     // Fetch all Context, Item, Artifact nodes with their names
     for label in &["Context", "Item", "Artifact"] {
@@ -73,6 +94,12 @@ async fn merge_similar_nodes(
             }
         }
 
+        tracing::info!(
+            label = %label,
+            node_count = names.len(),
+            "Scanning nodes for similarity"
+        );
+
         // Find similar pairs using Levenshtein distance
         let similar_pairs = find_similar_pairs(&names, 0.9);
 
@@ -85,11 +112,6 @@ async fn merge_similar_nodes(
             );
 
             // Merge: move all relationships from `remove` to `keep`, then delete `remove`.
-            // We use a two-step approach: fetch all relationships, re-create them from
-            // the target node, then delete the source node.
-            // 1. Get all relationships from source
-            // 2. Re-create them from target
-            // 3. Delete source
             let fetch_rels = format!(
                 "MATCH (source:{} {{name: $remove}})-[r]->(x) RETURN type(r) AS rel_type, x.name AS target_name, labels(x) AS target_labels",
                 label
@@ -136,7 +158,14 @@ async fn merge_similar_nodes(
                 let q = neo4rs::query(&create_rel)
                     .param("keep", keep.clone())
                     .param("target_name", target_name.clone());
-                let _ = graph.run(q).await;
+                if let Err(e) = graph.run(q).await {
+                    tracing::warn!(
+                        error = %e,
+                        keep = %keep,
+                        target = %target_name,
+                        "Failed to recreate outgoing relationship during merge"
+                    );
+                }
             }
 
             // Re-create incoming relationships to target
@@ -148,7 +177,14 @@ async fn merge_similar_nodes(
                 let q = neo4rs::query(&create_rel)
                     .param("keep", keep.clone())
                     .param("source_name", source_name.clone());
-                let _ = graph.run(q).await;
+                if let Err(e) = graph.run(q).await {
+                    tracing::warn!(
+                        error = %e,
+                        keep = %keep,
+                        source = %source_name,
+                        "Failed to recreate incoming relationship during merge"
+                    );
+                }
             }
 
             // Delete the old node
@@ -157,11 +193,19 @@ async fn merge_similar_nodes(
                 label
             );
             let q = neo4rs::query(&delete_q).param("remove", remove.clone());
-            let _ = graph.run(q).await;
+            if let Err(e) = graph.run(q).await {
+                tracing::warn!(
+                    error = %e,
+                    remove = %remove,
+                    "Failed to delete old node during merge"
+                );
+            } else {
+                total_merged += 1;
+            }
         }
     }
 
-    Ok(())
+    Ok(total_merged)
 }
 
 /// Find pairs of strings with similarity >= threshold using Levenshtein distance.
@@ -221,9 +265,10 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
 }
 
 /// 3.2 Compact old memories: merge MemoryChunks older than 30 days into monthly episodes.
+/// Returns the number of domain groups compacted.
 async fn compact_old_memories(
     config: &Config,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let graph = neo4rs::Graph::new(
         &config.neo4j_uri,
         &config.neo4j_user,
@@ -263,6 +308,13 @@ async fn compact_old_memories(
                 .push((slot_id, summary, timestamp));
         }
     }
+
+    tracing::info!(
+        domain_count = domain_groups.len(),
+        "Found domain groups for compaction"
+    );
+
+    let mut compacted_count = 0usize;
 
     for (domain, chunks) in domain_groups {
         if chunks.len() < 2 {
@@ -311,33 +363,38 @@ async fn compact_old_memories(
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!(error = %e, "Failed to call compaction LLM");
+                tracing::error!(error = %e, domain = %domain, "Failed to call compaction LLM");
                 continue;
             }
         };
 
         if !resp.status().is_success() {
-            tracing::error!(status = %resp.status(), "Compaction LLM returned error");
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::error!(status = %status, body = %body, domain = %domain, "Compaction LLM returned error");
             continue;
         }
 
         let completion: serde_json::Value = match resp.json().await {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!(error = %e, "Failed to parse compaction LLM response");
+                tracing::error!(error = %e, domain = %domain, "Failed to parse compaction LLM response");
                 continue;
             }
         };
 
         let raw_json = match completion["choices"][0]["message"]["content"].as_str() {
             Some(s) => s.trim().to_string(),
-            None => continue,
+            None => {
+                tracing::error!(domain = %domain, "Compaction LLM response missing content");
+                continue;
+            }
         };
 
         let compiled: CompiledMemory = match serde_json::from_str(&raw_json) {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!(error = %e, raw = %raw_json, "Failed to parse compaction result");
+                tracing::error!(error = %e, raw = %raw_json, domain = %domain, "Failed to parse compaction result");
                 continue;
             }
         };
@@ -362,7 +419,7 @@ async fn compact_old_memories(
         .param("domain", domain.clone());
 
         if let Err(e) = graph.run(create_monthly).await {
-            tracing::error!(error = %e, "Failed to create MonthlyMemoryChunk");
+            tracing::error!(error = %e, domain = %domain, "Failed to create MonthlyMemoryChunk");
             continue;
         }
 
@@ -372,7 +429,9 @@ async fn compact_old_memories(
                 "MATCH (m:MemoryChunk {slot_id: $slot_id}) DETACH DELETE m",
             )
             .param("slot_id", slot_id.clone());
-            let _ = graph.run(delete_q).await;
+            if let Err(e) = graph.run(delete_q).await {
+                tracing::warn!(error = %e, slot_id = %slot_id, "Failed to delete old MemoryChunk during compaction");
+            }
         }
 
         // Also clean up from Qdrant: delete old points by slot_id
@@ -392,11 +451,25 @@ async fn compact_old_memories(
                     }]
                 }
             });
-            let _ = qdrant_client
+            match qdrant_client
                 .post(&delete_url)
                 .json(&delete_body)
                 .send()
-                .await;
+                .await
+            {
+                Ok(resp) => {
+                    if !resp.status().is_success() {
+                        tracing::warn!(
+                            status = %resp.status(),
+                            slot_id = %slot_id,
+                            "Failed to delete old Qdrant point during compaction"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, slot_id = %slot_id, "Failed to send Qdrant delete request during compaction");
+                }
+            }
         }
 
         // Generate embedding for the new monthly summary and upsert to Qdrant
@@ -408,7 +481,7 @@ async fn compact_old_memories(
         {
             Ok(e) => e,
             Err(e) => {
-                tracing::error!(error = %e, "Failed to generate embedding for monthly chunk");
+                tracing::error!(error = %e, domain = %domain, "Failed to generate embedding for monthly chunk");
                 continue;
             }
         };
@@ -431,8 +504,22 @@ async fn compact_old_memories(
             }]
         });
 
-        let _ = qdrant_client.put(&upsert_url).json(&upsert_body).send().await;
+        match qdrant_client.put(&upsert_url).json(&upsert_body).send().await {
+            Ok(resp) => {
+                if !resp.status().is_success() {
+                    tracing::warn!(
+                        status = %resp.status(),
+                        domain = %domain,
+                        "Failed to upsert monthly chunk to Qdrant"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, domain = %domain, "Failed to send Qdrant upsert for monthly chunk");
+            }
+        }
 
+        compacted_count += 1;
         tracing::info!(
             domain = %domain,
             old_chunks = chunks.len(),
@@ -441,19 +528,22 @@ async fn compact_old_memories(
         );
     }
 
-    Ok(())
+    Ok(compacted_count)
 }
 
 /// 3.3 Clean orphan data: remove Qdrant points without Neo4j MemoryChunk, and vice versa.
+/// Returns the number of orphan items removed.
 async fn clean_orphans(
     config: &Config,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let graph = neo4rs::Graph::new(
         &config.neo4j_uri,
         &config.neo4j_user,
         &config.neo4j_password,
     )
     .await?;
+
+    let mut total_removed = 0usize;
 
     // Check 1: Get all slot_ids from Neo4j MemoryChunks
     let query = neo4rs::query("MATCH (m:MemoryChunk) RETURN m.slot_id AS slot_id");
@@ -474,6 +564,11 @@ async fn clean_orphans(
         }
     }
 
+    tracing::info!(
+        neo4j_slot_count = neo4j_slot_ids.len(),
+        "Collected Neo4j slot IDs for orphan detection"
+    );
+
     // Check 1: Scan Qdrant and remove points not in Neo4j
     let qdrant_client = reqwest::Client::new();
     let base_url = config.qdrant_url.trim_end_matches('/');
@@ -488,38 +583,73 @@ async fn clean_orphans(
         "with_payload": true
     });
 
-    if let Ok(resp) = qdrant_client.post(&scroll_url).json(&scroll_body).send().await {
-        if resp.status().is_success() {
-            if let Ok(data) = resp.json::<serde_json::Value>().await {
-                if let Some(points) = data["result"]["points"].as_array() {
-                    for point in points {
-                        if let Some(slot_id) = point["payload"]["slot_id"].as_str() {
-                            if !neo4j_slot_ids.contains(slot_id) {
-                                // Delete orphan point from Qdrant
-                                if let Some(point_id) = point["id"].as_str() {
-                                    let delete_url = format!(
-                                        "{}/collections/user_memories/points/delete",
-                                        base_url
-                                    );
-                                    let delete_body = serde_json::json!({
-                                        "points": [point_id]
-                                    });
-                                    let _ = qdrant_client
-                                        .post(&delete_url)
-                                        .json(&delete_body)
-                                        .send()
-                                        .await;
-                                    tracing::info!(
-                                        slot_id = %slot_id,
-                                        qdrant_point_id = %point_id,
-                                        "Removed orphan Qdrant point"
-                                    );
+    match qdrant_client.post(&scroll_url).json(&scroll_body).send().await {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(data) => {
+                        if let Some(points) = data["result"]["points"].as_array() {
+                            for point in points {
+                                if let Some(slot_id) = point["payload"]["slot_id"].as_str() {
+                                    if !neo4j_slot_ids.contains(slot_id) {
+                                        // Delete orphan point from Qdrant
+                                        if let Some(point_id) = point["id"].as_str() {
+                                            let delete_url = format!(
+                                                "{}/collections/user_memories/points/delete",
+                                                base_url
+                                            );
+                                            let delete_body = serde_json::json!({
+                                                "points": [point_id]
+                                            });
+                                            match qdrant_client
+                                                .post(&delete_url)
+                                                .json(&delete_body)
+                                                .send()
+                                                .await
+                                            {
+                                                Ok(del_resp) => {
+                                                    if del_resp.status().is_success() {
+                                                        total_removed += 1;
+                                                        tracing::info!(
+                                                            slot_id = %slot_id,
+                                                            qdrant_point_id = %point_id,
+                                                            "Removed orphan Qdrant point"
+                                                        );
+                                                    } else {
+                                                        tracing::warn!(
+                                                            status = %del_resp.status(),
+                                                            slot_id = %slot_id,
+                                                            "Failed to delete orphan Qdrant point"
+                                                        );
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        error = %e,
+                                                        slot_id = %slot_id,
+                                                        "Failed to send Qdrant delete for orphan point"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to parse Qdrant scroll response");
+                    }
                 }
+            } else {
+                tracing::warn!(
+                    status = %resp.status(),
+                    "Qdrant scroll request failed"
+                );
             }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to connect to Qdrant for orphan scan");
         }
     }
 
@@ -537,9 +667,15 @@ async fn clean_orphans(
             label
         );
         let q = neo4rs::query(&orphan_query);
-        let _ = graph.run(q).await;
+        match graph.run(q).await {
+            Ok(_) => {
+                tracing::info!(label = %label, "Cleaned orphan nodes");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, label = %label, "Failed to clean orphan nodes");
+            }
+        }
     }
 
-    tracing::info!("Orphan cleanup complete");
-    Ok(())
+    Ok(total_removed)
 }

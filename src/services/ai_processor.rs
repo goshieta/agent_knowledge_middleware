@@ -121,6 +121,13 @@ pub async fn process_raw_content(
     raw_content: &str,
     existing_topics: &[String],
 ) -> Result<AiProcessedResult, Box<dyn std::error::Error + Send + Sync>> {
+    tracing::info!(
+        source = %source,
+        content_len = raw_content.len(),
+        existing_topic_count = existing_topics.len(),
+        "Calling AI to process raw content"
+    );
+
     let client = reqwest::Client::new();
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
@@ -177,6 +184,12 @@ pub async fn process_raw_content(
     // Parse the JSON response from the model
     let result: AiProcessedResult = serde_json::from_str(&raw_json)
         .map_err(|e| format!("Failed to parse AI response as JSON: {}. Raw: {}", e, raw_json))?;
+
+    tracing::info!(
+        topic = %result.topic,
+        summary_len = result.summary.len(),
+        "AI processing completed successfully"
+    );
 
     Ok(result)
 }

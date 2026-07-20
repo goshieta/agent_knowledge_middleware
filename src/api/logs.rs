@@ -6,8 +6,9 @@ use serde_json::json;
 use std::sync::Arc;
 
 use crate::{
-    models::IngestLogRequest,
+    models::{truncate_str, IngestLogRequest},
     services::{ai_processor, slot_manager},
+    AppState,
 };
 
 pub async fn handle_logs(
@@ -65,17 +66,5 @@ pub async fn handle_logs(
             let body = json!({"status": "error", "message": e.to_string()});
             (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(body))
         }
-    }
-}
-
-use crate::AppState;
-
-/// Truncate a string to at most `max_len` characters, appending "..." if truncated.
-fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.chars().count() <= max_len {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max_len).collect();
-        format!("{}...", truncated)
     }
 }

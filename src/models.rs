@@ -85,3 +85,14 @@ pub struct EmbeddingRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
 }
+
+/// Truncate a string to at most `max_len` characters, appending "..." if truncated.
+/// Shared utility used across the codebase for log previews.
+pub fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.chars().count() <= max_len {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_len).collect();
+        format!("{}...", truncated)
+    }
+}

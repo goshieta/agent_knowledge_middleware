@@ -55,6 +55,13 @@ pub async fn compile_slot_memory(
     topic: &str,
     timeline_entries: &[TimelineEntry],
 ) -> Result<CompiledMemory, Box<dyn std::error::Error + Send + Sync>> {
+    tracing::info!(
+        slot_id = %slot_id,
+        topic = %topic,
+        entry_count = timeline_entries.len(),
+        "Starting memory compilation via LLM"
+    );
+
     // Build the user message from timeline entries
     let mut log_text = String::new();
     for entry in timeline_entries {
@@ -109,6 +116,14 @@ pub async fn compile_slot_memory(
     let compiled: CompiledMemory = serde_json::from_str(&raw_json)
         .map_err(|e| format!("Failed to parse compiler AI response: {}. Raw: {}", e, raw_json))?;
 
+    tracing::info!(
+        slot_id = %slot_id,
+        domain = %compiled.domain,
+        triple_count = compiled.triples.len(),
+        summary_len = compiled.summary.len(),
+        "Memory compilation via LLM complete"
+    );
+
     Ok(compiled)
 }
 
@@ -117,6 +132,13 @@ pub async fn generate_embedding(
     config: &Config,
     text: &str,
 ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
+    let text_preview = crate::models::truncate_str(text, 100);
+    tracing::info!(
+        text_len = text.len(),
+        text_preview = %text_preview,
+        "Generating embedding"
+    );
+
     let client = reqwest::Client::new();
     let url = format!(
         "{}/embeddings",
@@ -144,6 +166,10 @@ pub async fn generate_embedding(
     }
 
     let emb_resp: EmbeddingResponse = resp.json().await?;
+    tracing::info!(
+        embedding_dim = emb_resp.embedding.len(),
+        "Embedding generated successfully"
+    );
     Ok(emb_resp.embedding)
 }
 
@@ -168,8 +194,26 @@ pub async fn upsert_to_qdrant(
         }
     });
 
-    // Try to create the collection; ignore "already exists" errors
-    let _ = client.put(&collection_url).json(&create_body).send().await;
+    // Try to create the collection; log if it fails for reasons other than "already exists"
+    match client.put(&collection_url).json(&create_body).send().await {
+        Ok(resp) => {
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                tracing::warn!(
+                    status = %status,
+                    body = %body,
+                    "Qdrant collection creation returned non-success (may already exist)"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Failed to ensure Qdrant collection exists (will attempt upsert anyway)"
+            );
+        }
+    }
 
     // Upsert the point
     let upsert_url = format!("{}/collections/user_memories/points", base_url);
@@ -200,6 +244,7 @@ pub async fn upsert_to_qdrant(
     tracing::info!(
         slot_id = %slot_id,
         qdrant_point_id = %point_id,
+        domain = %compiled.domain,
         "Upserted compiled memory to Qdrant"
     );
 
@@ -213,6 +258,12 @@ pub async fn write_to_neo4j(
     timestamp: i64,
     compiled: &CompiledMemory,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing::info!(
+        slot_id = %slot_id,
+        triple_count = compiled.triples.len(),
+        "Writing compiled memory to Neo4j"
+    );
+
     let uri = &config.neo4j_uri;
     let user = &config.neo4j_user;
     let password = &config.neo4j_password;
@@ -234,11 +285,14 @@ pub async fn write_to_neo4j(
     graph.run(create_chunk).await?;
 
     // 2. Process each triple
+    let mut success_count = 0;
+    let mut fail_count = 0;
     for triple in &compiled.triples {
         let cypher = build_triple_cypher(triple, slot_id);
         match graph.run(cypher).await {
-            Ok(_) => {}
+            Ok(_) => success_count += 1,
             Err(e) => {
+                fail_count += 1;
                 tracing::warn!(
                     slot_id = %slot_id,
                     triple = ?triple,
@@ -251,7 +305,8 @@ pub async fn write_to_neo4j(
 
     tracing::info!(
         slot_id = %slot_id,
-        triple_count = compiled.triples.len(),
+        success_count = success_count,
+        fail_count = fail_count,
         "Wrote compiled memory to Neo4j"
     );
 
@@ -294,13 +349,19 @@ fn map_label(type_str: &str) -> &str {
 }
 
 /// Full pipeline: compile a flushed slot into long-term memory.
-/// Returns the context_name extracted from the first Context triple (if any).
 pub async fn compile_and_store(
     config: Arc<Config>,
     slot_id: &str,
     topic: &str,
     timeline_entries: &[TimelineEntry],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing::info!(
+        slot_id = %slot_id,
+        topic = %topic,
+        entry_count = timeline_entries.len(),
+        "Starting compile_and_store pipeline"
+    );
+
     if timeline_entries.is_empty() {
         tracing::info!(slot_id = %slot_id, "Skipping compilation for empty slot");
         return Ok(());
@@ -313,12 +374,6 @@ pub async fn compile_and_store(
 
     // Step 1: Compile via LLM
     let compiled = compile_slot_memory(&config, slot_id, topic, timeline_entries).await?;
-    tracing::info!(
-        slot_id = %slot_id,
-        domain = %compiled.domain,
-        triple_count = compiled.triples.len(),
-        "Memory compilation complete"
-    );
 
     // Extract context_name from the first Context triple, or fall back to topic
     let context_name = compiled
@@ -329,17 +384,30 @@ pub async fn compile_and_store(
         .unwrap_or_else(|| topic.to_string());
 
     // Step 2: Generate embedding
-    let embedding = generate_embedding(&config, &compiled.summary).await?;
+    let embedding = match generate_embedding(&config, &compiled.summary).await {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!(slot_id = %slot_id, error = %e, "Failed to generate embedding");
+            return Err(e);
+        }
+    };
 
     // Step 3: Write to Qdrant
     if let Err(e) = upsert_to_qdrant(&config, slot_id, timestamp, &context_name, &compiled, embedding).await {
         tracing::error!(slot_id = %slot_id, error = %e, "Failed to upsert to Qdrant");
+        return Err(e);
     }
 
     // Step 4: Write to Neo4j
     if let Err(e) = write_to_neo4j(&config, slot_id, timestamp, &compiled).await {
         tracing::error!(slot_id = %slot_id, error = %e, "Failed to write to Neo4j");
+        return Err(e);
     }
+
+    tracing::info!(
+        slot_id = %slot_id,
+        "compile_and_store pipeline completed successfully"
+    );
 
     Ok(())
 }

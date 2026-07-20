@@ -242,30 +242,50 @@ curl -X POST http://localhost:3000/api/logs \
 * `content_len` — 生コンテンツの文字数
 * `content` — 200 文字までに切り詰めたプレビュー（超過時は `...` 付与）
 
-### 8.2 AI 処理完了時 (`services/slot_manager.rs`)
-* `topic` — AI が抽出したトピックラベル
-* `summary` — 150 文字までの要約プレビュー
-* `summary_len` — 要約全体の文字数
+### 8.2 AI 処理 (`services/ai_processor.rs`)
+* 処理開始時: `source`, `content_len`, `existing_topic_count` を出力
+* 処理完了時: `topic`, `summary_len` を出力
 
-### 8.3 Redis 登録完了時 (`services/slot_manager.rs`)
-* `slot_id` — 割り当てられたスロット UUID
-* `topic` — トピック
-* `summary` — 120 文字までの要約プレビュー
-* 新規スロット作成時: `"Created new slot and stored timeline entry"`
-* 既存スロット追記時: `"Appended to existing slot timeline"`
+### 8.3 スロット管理 (`services/slot_manager.rs`)
+* AI 処理結果受信時: `topic`, `summary`（150 文字プレビュー）, `summary_len` を出力
+* Redis 登録完了時: `slot_id`, `topic`, `summary`（120 文字プレビュー）を出力
+  * 新規スロット作成時: `"Created new slot and stored timeline entry"`
+  * 既存スロット追記時: `"Appended to existing slot timeline"`
+* スロットフラッシュ時: `slot`, `topic`, `entry_count` を出力
+* コンテキストシフト検出時: フラッシュ対象スロットの UUID と新規スロットの UUID を出力
 
-### 8.4 コンテキストシフト検出時
-* フラッシュ対象スロットの UUID と新規スロットの UUID を出力
+### 8.4 長期記憶編纂 (`services/memory_compiler.rs`)
+* 編纂開始時: `slot_id`, `topic`, `entry_count` を出力
+* LLM 編纂完了時: `slot_id`, `domain`, `triple_count`, `summary_len` を出力
+* 埋め込み生成時: `text_len`, `text_preview`（100 文字）, `embedding_dim` を出力
+* Qdrant Upsert 時: `slot_id`, `qdrant_point_id`, `domain` を出力
+* Neo4j 書き込み時: `slot_id`, `triple_count`, `success_count`, `fail_count` を出力
+* パイプライン完了時: `"compile_and_store pipeline completed successfully"`
 
-### 8.5 エラー時
+### 8.5 長期記憶管理 (`services/memory_janitor.rs`)
+* サイクル開始/終了: `"=== Starting memory janitor cycle ==="` / `"=== Memory janitor cycle complete ==="`
+* 各ステップ開始時: `"Janitor step N/3: ..."` を出力
+* ノード統合時: スキャン対象ノード数、統合ペアの `label`, `keep`, `remove` を出力
+* メモリ圧縮時: ドメインごとの `chunk_count`、圧縮結果を出力
+* 孤立データ削除時: 削除された Qdrant ポイントの `slot_id`, `qdrant_point_id` を出力
+
+### 8.6 タイムアウト監視 (`workers/timeout_monitor.rs`)
+* 監視サイクル開始時: `active_slot_count` を出力（`debug` レベル）
+* スロットタイムアウト時: `slot`, `idle_seconds` を出力
+
+### 8.7 エラー時
 * 全エラーは `tracing::error!` で記録され、サーバープロセスは継続稼働する
+* 個別のスロット処理失敗は他のスロット処理に影響しない（エラーアイソレーション）
 
 ---
 
 ## 9. 実装時の注意点
 
 * **エラーハンドリング**: Redis 接続失敗、AI API エラー、JSON パースエラー、Qdrant/Neo4j/Embedding API エラーは `panic!` せず、`tracing` に記録してサーバー稼働を維持すること。
+* **エラーアイソレーション**: 個別のスロット処理失敗（タイムアウト監視、コンテキストシフトフラッシュ）は他のスロット処理に影響しない。各処理は独立してエラーハンドリングされる。
 * **共有状態**: `axum::Extension` を用いて Redis 接続プールと設定情報（`Arc<Config>`）をハンドラ間で安全に共有する。
+* **コードの一貫性**: 文字列切り詰めユーティリティ `truncate_str` は `models.rs` に一元化され、全モジュールから共有利用される。
+* **トピックマッチング**: スロット割り当て時のトピックマッチングは双方向（既存トピックが新規トピックを含む、またはその逆）で判定される。
 * **テスト**: `tests/integration_test.rs` でエンドポイントの正常系シナリオを検証（Redis と AI サーバーの起動が必要）。`tests/long_term_memory_test.rs` でデータモデルのシリアライズ、レーベンシュタイン距離計算、設定読み込みのユニットテストを実施。
 
 ---

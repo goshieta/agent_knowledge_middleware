@@ -5,7 +5,7 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use crate::config::Config;
-use crate::models::{AiProcessedResult, TimelineEntry};
+use crate::models::{truncate_str, AiProcessedResult, TimelineEntry};
 
 /// Key for tracking recent slot assignments to detect rapid context shifts.
 const CONTEXT_SHIFT_KEY: &str = "context_shift:recent_logs";
@@ -49,8 +49,10 @@ for _, uuid in ipairs(uuids) do
     local existing_topic = redis.call('HGET', meta_key, 'topic')
     if existing_topic then
         table.insert(all_topics, existing_topic)
-        -- Match: exact match or existing topic contains the new topic
-        if existing_topic == topic or string.find(existing_topic, topic, 1, true) then
+        -- Match: exact match, or one contains the other (bidirectional)
+        if existing_topic == topic
+            or string.find(existing_topic, topic, 1, true)
+            or string.find(topic, existing_topic, 1, true) then
             matched_uuid = uuid
         end
     end
@@ -272,41 +274,34 @@ pub async fn process_log(
     Ok(slot_id)
 }
 
-/// Truncate a string to at most `max_len` characters, appending "..." if truncated.
-fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.chars().count() <= max_len {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max_len).collect();
-        format!("{}...", truncated)
-    }
-}
-
 /// Immediately flush a slot: delete its Redis data and remove from active set.
-/// Also triggers long-term memory compilation if a config is provided.
 pub async fn flush_slot(
-    con: &mut redis::aio::MultiplexedConnection,
+    con: &redis::aio::MultiplexedConnection,
     uuid: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!(slot = %uuid, "Flushing slot data");
 
+    let mut con = con.clone();
     let meta_key = format!("slot:{}:meta", uuid);
     let timeline_key = format!("slot:{}:timeline", uuid);
 
     con.del::<_, ()>(&[&meta_key, &timeline_key]).await?;
     con.srem::<_, _, ()>("active_slots", uuid).await?;
 
+    tracing::info!(slot = %uuid, "Slot flushed successfully");
     Ok(())
 }
 
 /// Flush a slot and compile its timeline into long-term memory.
-/// This variant is used when we have access to the full AppState.
 pub async fn flush_slot_with_compilation(
-    con: &mut redis::aio::MultiplexedConnection,
+    con: &redis::aio::MultiplexedConnection,
     uuid: &str,
     config: Arc<Config>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing::info!(slot = %uuid, "Flushing slot with compilation");
+
     // Fetch the timeline and topic before deleting
+    let mut con = con.clone();
     let timeline_key = format!("slot:{}:timeline", uuid);
     let meta_key = format!("slot:{}:meta", uuid);
 
@@ -318,8 +313,15 @@ pub async fn flush_slot_with_compilation(
         .filter_map(|s| serde_json::from_str::<TimelineEntry>(s).ok())
         .collect();
 
+    tracing::info!(
+        slot = %uuid,
+        topic = ?topic,
+        entry_count = timeline_entries.len(),
+        "Fetched timeline entries for compilation"
+    );
+
     // Flush the slot from Redis
-    flush_slot(con, uuid).await?;
+    flush_slot(&con, uuid).await?;
 
     // Trigger long-term memory compilation in the background
     if let Some(topic) = topic {
